@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "img-attack-pkg"
+version = "0.1.0"
+description = "Batch image attack/manipulation pipeline"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "opencv-python",
+  "torch",
+  "torchvision",
+  "pillow",
+  "kornia",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
