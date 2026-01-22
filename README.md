@@ -2,4 +2,4 @@
 
 ## Install (from GitHub)
 ```bash
-pip install git+https://github.com/<jessieweneedtocook>/image_attack.git
+pip install git+https://github.com/jessieweneedtocook/image_attack.git
