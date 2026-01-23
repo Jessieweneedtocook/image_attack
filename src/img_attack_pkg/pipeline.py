@@ -157,8 +157,25 @@ def _attack_folder(spec: AttackSpec) -> str:
 def _output_filename(base: str, spec: AttackSpec, ext: str = ".png") -> str:
     return f"{base}_{spec.name}_{spec.param}{ext}"
 
-
 def run_selected(
+    image: Union[str, Path, "np.ndarray"],
+    attack_tokens: Sequence[Union[str, int, float]],
+) -> Dict[str, "np.ndarray"]:
+
+    specs = parse_attack_tokens(attack_tokens)
+    li = load_image(image)
+    
+    x = bgr_u8_to_torch_m11(li.bgr_u8)
+    outputs: Dict[str, np.ndarray] = {}
+
+    for spec in specs:
+        y = _apply_one_attack(x, spec)
+        y_bgr = torch_m11_to_bgr_u8(y)
+        outputs[_attack_folder(spec)] = y_bgr
+
+    return outputs
+    
+def run_selected2(
     image_dir: Union[str, Path],
     attack_tokens: Sequence[Union[str, int, float]],
     out_dir: Union[str, Path],
