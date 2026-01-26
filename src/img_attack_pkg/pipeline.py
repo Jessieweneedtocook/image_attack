@@ -225,7 +225,7 @@ def run_all(
         for p in lv.get(a, []):
             tokens.extend([a, p])
 
-    return run_selected(
+    return run_selected2(
         image_dir=image_dir,
         attack_tokens=tokens,
         out_dir=out_dir,
