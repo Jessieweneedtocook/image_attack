@@ -43,17 +43,17 @@ _ATTACKS: Dict[str, Tuple[Callable, str]] = {
 
 # Default 3 “levels” for run_all
 DEFAULT_LEVELS: Dict[str, List[Union[int, float, str]]] = {
-    "rotation": [10, 30, 60],
-    "crop": [90, 75, 50],
-    "scale": [5, 10, 20],
+    "rotation": [10, 30, 70],
+    "crop": [90, 70, 40],
+    "scale": [5, 15, 35],
     "flip": ["H", "V", "B"],
     "resize": [10, 30, 60],
     "jpeg": [90, 50, 20],
     "gaussian": [5, 15, 30],      
-    "speckle": [0.03, 0.07, 0.12],
-    "blur": [3, 5, 9],
-    "brightness": [1.1, 1.3, 1.6],
-    "sharpness": [0.5, 1.0, 1.5],
+    "speckle": [0.02, 0.06, 0.12],
+    "blur": [3, 7, 15],
+    "brightness": [0.85, 1.25, 1.6],
+    "sharpness": [0.3, 0.8, 1.5],
     "median": [3, 5, 9],
 }
 
