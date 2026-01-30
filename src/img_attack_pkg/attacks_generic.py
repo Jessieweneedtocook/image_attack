@@ -1,11 +1,12 @@
 # attacks_generic.py
-# Goal:
-# Accepts an input tensor in common layouts (CHW / HWC / BCHW / BHWC / HW)
-# Internally converts it to BCHW in the [-1, 1] range
-# Applies the same attacks using the original function names and parameters (Geometric + Signal)
-# Returns the output in the same layout, dtype, and (as much as possible) the same value range as the input
+# الهدف:
+# - يستقبل أي Tensor بأي شكل شائع (CHW / HWC / BCHW / BHWC / HW)
+# - يحوله داخليًا إلى BCHW ضمن المجال [-1, 1]
+# - يطبق الهجمات (Geometric + Signal)
+# - يرجّع الناتج بنفس شكل الإدخال ونفس dtype ونفس المجال الذي جاء منه (قدر الإمكان)
 
 import io
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -13,6 +14,7 @@ import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
 from PIL import Image
 import torchvision.io as tvio
+
 try:
     import kornia
     import kornia.filters as Kf
@@ -22,10 +24,8 @@ except Exception:
     _HAS_KORNIA = False
 
 
-
-
 # ============================================================
-# 1) Shape
+# 1) Shape + Range Adapters
 # ============================================================
 def _detect_layout(x: torch.Tensor) -> str:
     """
@@ -65,11 +65,11 @@ def _to_bchw(x: torch.Tensor):
     elif layout == "CHW":
         x_bchw = x.unsqueeze(0)                            # 1xCxHxW
     elif layout == "HWC":
-        x_bchw = x.permute(2, 0, 1).unsqueeze(0)          # 1xCxHxW
+        x_bchw = x.permute(2, 0, 1).unsqueeze(0)           # 1xCxHxW
     elif layout == "BCHW":
         x_bchw = x
     elif layout == "BHWC":
-        x_bchw = x.permute(0, 3, 1, 2)                    # BxCxHxW
+        x_bchw = x.permute(0, 3, 1, 2)                     # BxCxHxW
     else:
         raise ValueError(f"Unsupported layout={layout}")
 
@@ -109,15 +109,12 @@ def _detect_range_mode(x: torch.Tensor) -> str:
     x_min = float(safe.min().item())
     x_max = float(safe.max().item())
 
-    # داخل [-1,1] (قد تكون 0..1 أو -1..1)
     if x_min >= -1.0001 and x_max <= 1.0001:
         return "float_0_1" if x_min >= -0.0001 else "float_-1_1"
 
-    # داخل 0..255 تقريبًا
     if x_min >= -0.0001 and x_max <= 255.0001:
         return "float_0_1" if x_max <= 1.0001 else "float_0_255"
 
-    # fallback
     return "float_-1_1"
 
 
@@ -135,7 +132,6 @@ def _to_minus1_1(x: torch.Tensor, mode: str) -> torch.Tensor:
         x01 = (x.to(torch.float32) / 255.0).clamp(0.0, 1.0)
         return (x01 * 2.0 - 1.0).clamp(-1.0, 1.0)
 
-    # float_-1_1
     return x.to(torch.float32).clamp(-1.0, 1.0)
 
 
@@ -157,7 +153,6 @@ def _from_minus1_1(x_m11: torch.Tensor, mode: str, orig_dtype: torch.dtype) -> t
         x255 = (x01 * 255.0).clamp(0.0, 255.0)
         return x255.to(orig_dtype)
 
-    # float_-1_1
     return x_m11.to(orig_dtype)
 
 
@@ -192,31 +187,56 @@ def rotate_tensor(x: torch.Tensor, angle: float) -> torch.Tensor:
             expand=False,
             fill=-1.0,
         )
-
     return _apply_attack_preserve(x, _core)
 
 
-def crop(x: torch.Tensor, pct: int, start_y: int = 50, start_x: int = 50) -> torch.Tensor:
+def crop(x: torch.Tensor, pct: float) -> torch.Tensor:
+
     def _core(z: torch.Tensor):
         _, _, H, W = z.shape
-        crop_side = int(min(H, W) * (pct / 100.0))
-        crop_side = max(10, crop_side)
 
-        if (start_y + crop_side > H) or (start_x + crop_side > W):
+        dy = int(round(H * (float(pct) / 100.0)))
+        dx = int(round(W * (float(pct) / 100.0)))
+
+        dy = max(0, min(dy, (H - 2) // 2))
+        dx = max(0, min(dx, (W - 2) // 2))
+
+        if dy == 0 and dx == 0:
             return z
 
-        cropped = z[:, :, start_y : start_y + crop_side, start_x : start_x + crop_side]
-        return F.interpolate(cropped, size=(H, W), mode="bilinear", align_corners=False)
+        new_h = H - 2 * dy
+        new_w = W - 2 * dx
+
+        cropped = TF.crop(z, top=dy, left=dx, height=new_h, width=new_w)
+        resized = TF.resize(
+            cropped,
+            size=[H, W],
+            interpolation=InterpolationMode.BILINEAR,
+            antialias=False,
+        )
+        return resized
 
     return _apply_attack_preserve(x, _core)
 
 
-def scaled(x: torch.Tensor, pct: int) -> torch.Tensor:
+def scaled(x: torch.Tensor, scale: float) -> torch.Tensor:
+
     def _core(z: torch.Tensor):
         _, _, H, W = z.shape
-        scale = 1.0 + (pct / 100.0)
-        bigger = F.interpolate(z, scale_factor=scale, mode="bilinear", align_corners=False)
-        back = F.interpolate(bigger, size=(H, W), mode="bilinear", align_corners=False)
+        s = float(scale)
+
+        # backward compat: scale given as pct
+        if s > 3.0:
+            s = 1.0 + (s / 100.0)
+
+        if s <= 0:
+            return z
+
+        new_h = max(1, int(round(H * s)))
+        new_w = max(1, int(round(W * s)))
+
+        bigger = TF.resize(z, [new_h, new_w], interpolation=InterpolationMode.BILINEAR, antialias=False)
+        back   = TF.resize(bigger, [H, W], interpolation=InterpolationMode.BILINEAR, antialias=False)
         return back
 
     return _apply_attack_preserve(x, _core)
@@ -232,19 +252,20 @@ def flipping(x: torch.Tensor, mode: str) -> torch.Tensor:
         if m == "B":
             return torch.flip(z, dims=[2, 3])
         return z
-
     return _apply_attack_preserve(x, _core)
 
 
 def resized(x: torch.Tensor, pct: int) -> torch.Tensor:
     def _core(z: torch.Tensor):
         _, _, H, W = z.shape
-        level_ratio = pct / 100.0
-        down = max(0.2, 1.0 - level_ratio)  # 0.8/0.5/0.2
-        new_h = max(1, int(H * down))
-        new_w = max(1, int(W * down))
-        small = F.interpolate(z, size=(new_h, new_w), mode="bilinear", align_corners=False)
-        back = F.interpolate(small, size=(H, W), mode="bilinear", align_corners=False)
+        level_ratio = int(pct) / 100.0
+        down = max(0.2, 1.0 - level_ratio)
+
+        new_h = max(1, int(round(H * down)))
+        new_w = max(1, int(round(W * down)))
+
+        small = TF.resize(z, size=[new_h, new_w], interpolation=InterpolationMode.BILINEAR, antialias=False)
+        back  = TF.resize(small, size=[H, W], interpolation=InterpolationMode.BILINEAR, antialias=False)
         return back
 
     return _apply_attack_preserve(x, _core)
@@ -254,47 +275,110 @@ def resized(x: torch.Tensor, pct: int) -> torch.Tensor:
 # 3) Signal Processing Attacks
 # ============================================================
 def jpeg_compression(x: torch.Tensor, quality: int) -> torch.Tensor:
-    """
-    JPEG compression عبر torchvision.io (بدون ملفات) مع دعم Batch.
-    """
+    """JPEG compression via torchvision.io (in-memory) with batch support."""
     def _core(z: torch.Tensor):
         device = z.device
         z_cpu = z.detach().cpu().clamp(-1.0, 1.0)
 
         B, C, H, W = z_cpu.shape
         outs = []
-
         q = int(quality)
 
         for i in range(B):
-            # [-1,1] -> uint8 [0,255] بشكل CHW (torchvision expects CHW uint8)
             x01 = (z_cpu[i] + 1.0) / 2.0
-            img_u8 = (x01 * 255.0).round().clamp(0, 255).to(torch.uint8)   # CHW uint8
+            img_u8 = (x01 * 255.0).round().clamp(0, 255).to(torch.uint8)  # CHW
 
-            # encode -> bytes -> decode
             jpeg_bytes = tvio.encode_jpeg(img_u8, quality=q)
             dec_u8 = tvio.decode_jpeg(jpeg_bytes)  # CHW uint8
 
-            # رجوع إلى [-1,1] float
             dec_f = dec_u8.to(torch.float32) / 255.0
             dec_m11 = (dec_f * 2.0 - 1.0).clamp(-1.0, 1.0)
             outs.append(dec_m11)
 
-        out = torch.stack(outs, dim=0).to(device)  # BCHW [-1,1]
-        return out
+        return torch.stack(outs, dim=0).to(device)
 
     return _apply_attack_preserve(x, _core)
 
 
+def jpeg2000_compression(
+    x: torch.Tensor,
+    quality_layers=(20,),
+    quality_mode="rates",
+    irreversible=True,
+    ext="jp2",
+) -> torch.Tensor:
 
-def gaussian_noise(x: torch.Tensor, sigma: float) -> torch.Tensor:
-    """
-    sigma: نفس معنى كودك السابق (على مقياس 0..255).
-    """
+    def _core(z: torch.Tensor):
+        device = z.device
+        z_cpu = z.detach().cpu().clamp(-1.0, 1.0)
+        B, C, H, W = z_cpu.shape
+        outs = []
+
+        ql = quality_layers
+        if isinstance(ql, (int, float, np.integer, np.floating)):
+            ql = (int(ql),)
+
+        for i in range(B):
+            x01 = (z_cpu[i] + 1.0) / 2.0
+            img_u8 = (x01 * 255.0).round().clamp(0, 255).to(torch.uint8)
+
+            if img_u8.shape[0] == 1:
+                img_np = img_u8[0].numpy()
+                img_pil = Image.fromarray(img_np, mode="L")
+            else:
+                img_np = img_u8.permute(1, 2, 0).numpy()
+                img_pil = Image.fromarray(img_np, mode="RGB")
+
+            buf = io.BytesIO()
+            img_pil.save(
+                buf,
+                format="JPEG2000",
+                quality_mode=quality_mode,
+                quality_layers=list(ql),
+                irreversible=bool(irreversible),
+            )
+            buf.seek(0)
+
+            dec_pil = Image.open(buf)
+            if img_u8.shape[0] == 1:
+                dec_pil = dec_pil.convert("L")
+                dec_np = np.array(dec_pil, dtype=np.uint8)  # H W
+                dec_u8 = torch.from_numpy(dec_np).unsqueeze(0)  # 1 H W
+            else:
+                dec_pil = dec_pil.convert("RGB")
+                dec_np = np.array(dec_pil, dtype=np.uint8)  # H W 3
+                dec_u8 = torch.from_numpy(dec_np).permute(2, 0, 1).contiguous()  # 3 H W
+
+            dec_f = dec_u8.to(torch.float32) / 255.0
+            dec_m11 = (dec_f * 2.0 - 1.0).clamp(-1.0, 1.0)
+            outs.append(dec_m11)
+
+        return torch.stack(outs, dim=0).to(device)
+
+    return _apply_attack_preserve(x, _core)
+
+
+def gaussian_noise(x: torch.Tensor, var: float = 0.01) -> torch.Tensor:
+
     def _core(z: torch.Tensor):
         z = z.clamp(-1.0, 1.0)
-        sigma_norm = (float(sigma) / 255.0) * 2.0
-        noise = torch.randn_like(z) * sigma_norm
+        v = float(var)
+
+        # backward compat: old sigma values (5,15,30) etc.
+        if v > 1.0:
+            sigma01 = v / 255.0
+            v = sigma01 * sigma01
+
+        sigma01 = math.sqrt(max(v, 0.0))
+        sigma_m11 = 2.0 * sigma01  # convert [0,1] sigma to [-1,1] sigma
+
+        noise = torch.normal(
+            mean=0.0,
+            std=sigma_m11,
+            size=z.shape,
+            device=z.device,
+            dtype=z.dtype,
+        )
         return (z + noise).clamp(-1.0, 1.0)
 
     return _apply_attack_preserve(x, _core)
@@ -305,8 +389,8 @@ def speckle_noise(x: torch.Tensor, sigma: float) -> torch.Tensor:
         z = z.clamp(-1.0, 1.0)
         noise = torch.randn_like(z) * float(sigma)
         return (z + z * noise).clamp(-1.0, 1.0)
-
     return _apply_attack_preserve(x, _core)
+
 
 def blurring(x: torch.Tensor, k: int) -> torch.Tensor:
     def _core(z: torch.Tensor):
@@ -315,13 +399,10 @@ def blurring(x: torch.Tensor, k: int) -> torch.Tensor:
             kk += 1
 
         if _HAS_KORNIA:
-            # Kornia expects BCHW float
             sigma = float(kk) / 6.0
-            # kernel_size must be (ky, kx), sigma can be (sy, sx)
             out = Kf.gaussian_blur2d(z, (kk, kk), (sigma, sigma))
             return out.clamp(-1.0, 1.0)
 
-        # fallback torchvision
         sigma = float(kk) / 6.0
         out = TF.gaussian_blur(z, kernel_size=[kk, kk], sigma=[sigma, sigma])
         return out.clamp(-1.0, 1.0)
@@ -329,32 +410,21 @@ def blurring(x: torch.Tensor, k: int) -> torch.Tensor:
     return _apply_attack_preserve(x, _core)
 
 
-
 def brightness(x: torch.Tensor, factor: float) -> torch.Tensor:
     def _core(z: torch.Tensor) -> torch.Tensor:
         z = z.clamp(-1.0, 1.0)
-
-        # [-1,1] -> [0,1]
         z01 = (z + 1.0) / 2.0
-
-        # apply brightness
         out01 = (z01 * float(factor)).clamp(0.0, 1.0)
-
-        # [0,1] -> [-1,1]
         return (out01 * 2.0 - 1.0).clamp(-1.0, 1.0)
-
     return _apply_attack_preserve(x, _core)
+
 
 def sharpness(x: torch.Tensor, amount: float = 1.0) -> torch.Tensor:
     def _core(z: torch.Tensor) -> torch.Tensor:
         z = z.clamp(-1.0, 1.0)
-
-        # Simple unsharp mask: x + amount * (x - blur)
         blur = F.avg_pool2d(z, kernel_size=3, stride=1, padding=1)
         out = z + float(amount) * (z - blur)
-
         return out.clamp(-1.0, 1.0)
-
     return _apply_attack_preserve(x, _core)
 
 
@@ -370,7 +440,6 @@ def median_filtering(x: torch.Tensor, k: int) -> torch.Tensor:
             out = Kf.median_blur(z, (kk, kk))
             return out.clamp(-1.0, 1.0)
 
-        # fallback (unfold median)
         B, C, H, W = z.shape
         pad = kk // 2
         z_pad = F.pad(z, (pad, pad, pad, pad), mode="reflect")
@@ -386,6 +455,7 @@ __all__ = [
     # geometric
     "rotate_tensor", "crop", "scaled", "flipping", "resized",
     # signal
-    "jpeg_compression", "gaussian_noise", "speckle_noise",
+    "jpeg_compression", "jpeg2000_compression",
+    "gaussian_noise", "speckle_noise",
     "blurring", "brightness", "sharpness", "median_filtering",
 ]
