@@ -23,6 +23,11 @@ try:
 except Exception:
     _HAS_KORNIA = False
 
+try:
+    from compressai.zoo import cheng2020_anchor
+    _HAS_COMPRESSAI = True
+except Exception:
+    _HAS_COMPRESSAI = False
 
 # ============================================================
 # 1) Shape + Range Adapters
@@ -357,6 +362,133 @@ def jpeg2000_compression(
 
     return _apply_attack_preserve(x, _core)
 
+# ------------------------------------------------------------
+# Helpers for JPEG-AI (CompressAI)
+# ------------------------------------------------------------
+_COMPRESSAI_MODEL_CACHE = {}
+
+def _get_cheng2020_anchor(device: torch.device, quality: int):
+    if not _HAS_COMPRESSAI:
+        raise ImportError(
+            "compressai is not installed. Install it to use jpegai_compression."
+        )
+
+    q = int(quality)
+    if q < 1 or q > 8:
+        raise ValueError("jpegai quality must be in [1..8] for cheng2020_anchor")
+
+    key = (str(device), q)
+    if key in _COMPRESSAI_MODEL_CACHE:
+        return _COMPRESSAI_MODEL_CACHE[key]
+
+    model = cheng2020_anchor(quality=q, pretrained=True).eval().to(device)
+    _COMPRESSAI_MODEL_CACHE[key] = model
+    return model
+
+def _pad_to_multiple_of_64(x01_bchw: torch.Tensor) -> tuple[torch.Tensor, int, int]:
+
+    _, _, h, w = x01_bchw.shape
+    pad_h = (64 - (h % 64)) % 64
+    pad_w = (64 - (w % 64)) % 64
+    x_pad = F.pad(x01_bchw, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
+    return x_pad, h, w
+def jpegai_compression(x: torch.Tensor, quality: int = 4) -> torch.Tensor:
+
+    def _core(z_m11: torch.Tensor):
+        device = z_m11.device
+
+        # [-1,1] -> [0,1]
+        z01 = ((z_m11 + 1.0) / 2.0).clamp(0.0, 1.0)
+
+        B, C, H, W = z01.shape
+
+        # CompressAI models expect 3-channel RGB.
+        if C == 1:
+            z01_in = z01.repeat(1, 3, 1, 1)
+            single_channel = True
+        elif C == 3:
+            z01_in = z01
+            single_channel = False
+        else:
+            raise ValueError(f"jpegai_compression supports only C=1 or C=3, got C={C}")
+
+        model = _get_cheng2020_anchor(device, int(quality))
+
+        x_pad, orig_h, orig_w = _pad_to_multiple_of_64(z01_in)
+
+        with torch.no_grad():
+            out = model(x_pad)
+            x_hat = out["x_hat"].clamp(0.0, 1.0)
+
+        # crop back to original size
+        x_hat = x_hat[:, :, :orig_h, :orig_w]
+
+        # if input was grayscale, return single channel (use first channel)
+        if single_channel:
+            x_hat = x_hat[:, :1, :, :]
+
+        # [0,1] -> [-1,1]
+        y_m11 = (x_hat * 2.0 - 1.0).clamp(-1.0, 1.0)
+        return y_m11
+
+    return _apply_attack_preserve(x, _core)
+
+def jpegxl_compression(x: torch.Tensor, quality: int = 50) -> torch.Tensor:
+
+    def _core(z: torch.Tensor):
+        device = z.device
+        z_cpu = z.detach().cpu().clamp(-1.0, 1.0)
+
+        B, C, H, W = z_cpu.shape
+        q = int(quality)
+        outs = []
+
+        for i in range(B):
+            x01 = (z_cpu[i] + 1.0) / 2.0
+            img_u8 = (x01 * 255.0).round().clamp(0, 255).to(torch.uint8)
+
+            # Create PIL image
+            if img_u8.shape[0] == 1:
+                img_np = img_u8[0].numpy()
+                img_pil = Image.fromarray(img_np, mode="L")
+            else:
+                img_np = img_u8.permute(1, 2, 0).numpy()
+                img_pil = Image.fromarray(img_np, mode="RGB")
+
+            buf = io.BytesIO()
+
+            # Try saving as JXL
+            try:
+                img_pil.save(buf, format="JXL", quality=q)
+            except Exception as e:
+                raise RuntimeError(
+                    "JPEG-XL save failed. Your Pillow likely lacks JXL support. "
+                    "Install/build Pillow with JXL support (or install pillow-jxl), "
+                    f"then retry. Original error: {e}"
+                )
+
+            buf.seek(0)
+
+            # Decode back
+            dec_pil = Image.open(buf)
+            if img_u8.shape[0] == 1:
+                dec_pil = dec_pil.convert("L")
+                dec_np = np.array(dec_pil, dtype=np.uint8)
+                dec_u8 = torch.from_numpy(dec_np).unsqueeze(0)
+            else:
+                dec_pil = dec_pil.convert("RGB")
+                dec_np = np.array(dec_pil, dtype=np.uint8)
+                dec_u8 = torch.from_numpy(dec_np).permute(2, 0, 1).contiguous()
+
+            dec_f = dec_u8.to(torch.float32) / 255.0
+            dec_m11 = (dec_f * 2.0 - 1.0).clamp(-1.0, 1.0)
+            outs.append(dec_m11)
+
+        return torch.stack(outs, dim=0).to(device)
+
+    return _apply_attack_preserve(x, _core)
+
+
 
 def gaussian_noise(x: torch.Tensor, var: float = 0.01) -> torch.Tensor:
 
@@ -456,6 +588,7 @@ __all__ = [
     "rotate_tensor", "crop", "scaled", "flipping", "resized",
     # signal
     "jpeg_compression", "jpeg2000_compression",
+    "jpegai_compression", "jpegxl_compression",
     "gaussian_noise", "speckle_noise",
     "blurring", "brightness", "sharpness", "median_filtering",
 ]
