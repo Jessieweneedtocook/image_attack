@@ -32,6 +32,10 @@ _ATTACKS: Dict[str, Tuple[Callable, str]] = {
     "jpeg_compression": (A.jpeg_compression, "quality"),
     "jpeg2000": (A.jpeg2000_compression, "quality_layers"),
     "jpeg2000_compression": (A.jpeg2000_compression, "quality_layers"),
+    "jpegai": (A.jpegai_compression, "quality"),
+    "jpegai_compression": (A.jpegai_compression, "quality"),
+    "jpegxl": (A.jpegxl_compression, "quality"),
+    "jpegxl_compression": (A.jpegxl_compression, "quality"),
     "gaussian": (A.gaussian_noise, "var"),
     "gaussian_noise": (A.gaussian_noise, "var"),
     "speckle": (A.speckle_noise, "sigma"),
@@ -65,6 +69,10 @@ def _canonical_attack_name(raw: str) -> str:
         return "jpeg"
     if r in ("jpeg2000_compression", "jpeg2000", "jp2", "j2k"):
         return "jpeg2000"
+    if r in ("jpegai_compression", "jpegai"):
+        return "jpegai"
+    if r in ("jpegxl_compression", "jpegxl", "jxl"):
+        return "jpegxl"
     if r in ("gaussian_noise", "gaussian"):
         return "gaussian"
     if r in ("speckle_noise", "speckle"):
@@ -117,7 +125,6 @@ def _apply_one_attack(x_m11_chw: torch.Tensor, spec: AttackSpec) -> torch.Tensor
     if spec.name == "rotation":
         return fn(x_m11_chw, float(spec.param))
     if spec.name in ("scale", "resize"):
-        # scale accepts float; resize uses int
         if spec.name == "scale":
             return fn(x_m11_chw, float(spec.param))
         return fn(x_m11_chw, int(spec.param))
@@ -126,10 +133,12 @@ def _apply_one_attack(x_m11_chw: torch.Tensor, spec: AttackSpec) -> torch.Tensor
     if spec.name == "jpeg":
         return fn(x_m11_chw, int(spec.param))
     if spec.name == "jpeg2000":
-        # attacks_generic accepts scalar and turns it into (scalar,)
+        return fn(x_m11_chw, int(spec.param))
+    if spec.name == "jpegai":
+        return fn(x_m11_chw, int(spec.param))
+    if spec.name == "jpegxl":
         return fn(x_m11_chw, int(spec.param))
     if spec.name == "gaussian":
-        # now conceptually var, but fn supports old sigma too
         return fn(x_m11_chw, float(spec.param))
     if spec.name == "speckle":
         return fn(x_m11_chw, float(spec.param))
