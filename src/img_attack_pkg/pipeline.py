@@ -21,16 +21,18 @@ _ATTACKS: Dict[str, Tuple[Callable, str]] = {
     "rotation": (A.rotate_tensor, "angle"),
     "crop": (A.crop, "pct"),
     "cropped": (A.crop, "pct"),
-    "scale": (A.scaled, "pct"),
-    "scaled": (A.scaled, "pct"),
+    "scale": (A.scaled, "scale"),
+    "scaled": (A.scaled, "scale"),
     "flip": (A.flipping, "mode"),
     "flipping": (A.flipping, "mode"),
     "resize": (A.resized, "pct"),
     "resized": (A.resized, "pct"),
     "jpeg": (A.jpeg_compression, "quality"),
     "jpeg_compression": (A.jpeg_compression, "quality"),
-    "gaussian": (A.gaussian_noise, "sigma"),
-    "gaussian_noise": (A.gaussian_noise, "sigma"),
+    "jpeg2000": (A.jpeg2000_compression, "quality_layers"),
+    "jpeg2000_compression": (A.jpeg2000_compression, "quality_layers"),
+    "gaussian": (A.gaussian_noise, "var"),
+    "gaussian_noise": (A.gaussian_noise, "var"),
     "speckle": (A.speckle_noise, "sigma"),
     "speckle_noise": (A.speckle_noise, "sigma"),
     "blur": (A.blurring, "k"),
@@ -41,26 +43,10 @@ _ATTACKS: Dict[str, Tuple[Callable, str]] = {
     "median_filtering": (A.median_filtering, "k"),
 }
 
-# Default 3 “levels” for run_all
-DEFAULT_LEVELS: Dict[str, List[Union[int, float, str]]] = {
-    "rotation": [10, 30, 70],
-    "crop": [90, 70, 40],
-    "scale": [5, 15, 35],
-    "flip": ["H", "V", "B"],
-    "resize": [10, 30, 60],
-    "jpeg": [90, 50, 20],
-    "gaussian": [5, 15, 30],      
-    "speckle": [0.02, 0.06, 0.12],
-    "blur": [3, 7, 15],
-    "brightness": [0.85, 1.25, 1.6],
-    "sharpness": [0.3, 0.8, 1.5],
-    "median": [3, 5, 9],
-}
-
 
 @dataclass(frozen=True)
 class AttackSpec:
-    name: str                   
+    name: str
     param: Union[int, float, str]
 
 
@@ -76,6 +62,8 @@ def _canonical_attack_name(raw: str) -> str:
         return "resize"
     if r in ("jpeg_compression", "jpeg"):
         return "jpeg"
+    if r in ("jpeg2000_compression", "jpeg2000", "jp2", "j2k"):
+        return "jpeg2000"
     if r in ("gaussian_noise", "gaussian"):
         return "gaussian"
     if r in ("speckle_noise", "speckle"):
@@ -88,7 +76,6 @@ def _canonical_attack_name(raw: str) -> str:
 
 
 def parse_attack_tokens(tokens: Sequence[Union[str, int, float]]) -> List[AttackSpec]:
-
     flat = [str(t) for t in tokens]
     if len(flat) % 2 != 0:
         raise ValueError(f"Expected even number of tokens (name,param,...). Got: {tokens}")
@@ -125,16 +112,23 @@ def _apply_one_attack(x_m11_chw: torch.Tensor, spec: AttackSpec) -> torch.Tensor
     fn, _param_name = _ATTACKS[lookup_key]
 
     if spec.name == "crop":
-        return fn(x_m11_chw, int(spec.param))
+        return fn(x_m11_chw, float(spec.param))
     if spec.name == "rotation":
         return fn(x_m11_chw, float(spec.param))
     if spec.name in ("scale", "resize"):
+        # scale accepts float; resize uses int
+        if spec.name == "scale":
+            return fn(x_m11_chw, float(spec.param))
         return fn(x_m11_chw, int(spec.param))
     if spec.name == "flip":
         return fn(x_m11_chw, str(spec.param))
     if spec.name == "jpeg":
         return fn(x_m11_chw, int(spec.param))
+    if spec.name == "jpeg2000":
+        # attacks_generic accepts scalar and turns it into (scalar,)
+        return fn(x_m11_chw, int(spec.param))
     if spec.name == "gaussian":
+        # now conceptually var, but fn supports old sigma too
         return fn(x_m11_chw, float(spec.param))
     if spec.name == "speckle":
         return fn(x_m11_chw, float(spec.param))
@@ -157,16 +151,16 @@ def _attack_folder(spec: AttackSpec) -> str:
 def _output_filename(base: str, spec: AttackSpec, ext: str = ".png") -> str:
     return f"{base}_{spec.name}_{spec.param}{ext}"
 
-def run_selected(
-    image: Union[str, Path, "np.ndarray"],
-    attack_tokens: Sequence[Union[str, int, float]],
-) -> Dict[str, "np.ndarray"]:
 
+def run_selected_file(
+    image,
+    attack_tokens: Sequence[Union[str, int, float]],
+):
     specs = parse_attack_tokens(attack_tokens)
-    li = load_image(image)
-    
+    li = load_image(image)  # NOTE: this must exist in your codebase
+
     x = bgr_u8_to_torch_m11(li.bgr_u8)
-    outputs: Dict[str, np.ndarray] = {}
+    outputs = {}
 
     for spec in specs:
         y = _apply_one_attack(x, spec)
@@ -174,8 +168,9 @@ def run_selected(
         outputs[_attack_folder(spec)] = y_bgr
 
     return outputs
-    
-def run_selected2(
+
+
+def run_selected_folder(
     image_dir: Union[str, Path],
     attack_tokens: Sequence[Union[str, int, float]],
     out_dir: Union[str, Path],
@@ -206,27 +201,3 @@ def run_selected2(
     return written
 
 
-def run_all(
-    image_dir: Union[str, Path],
-    out_dir: Union[str, Path],
-    levels: Optional[Dict[str, List[Union[int, float, str]]]] = None,
-    attacks: Optional[Sequence[str]] = None,
-) -> Dict[str, List[str]]:
-   
-    lv = dict(DEFAULT_LEVELS)
-    if levels:
-        for k, v in levels.items():
-            lv[_canonical_attack_name(k)] = list(v)
-
-    chosen = [_canonical_attack_name(a) for a in (attacks if attacks else lv.keys())]
-
-    tokens: List[Union[str, int, float]] = []
-    for a in chosen:
-        for p in lv.get(a, []):
-            tokens.extend([a, p])
-
-    return run_selected2(
-        image_dir=image_dir,
-        attack_tokens=tokens,
-        out_dir=out_dir,
-    )
