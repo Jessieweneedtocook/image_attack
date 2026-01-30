@@ -11,6 +11,7 @@ import torch
 from . import attacks_generic as A
 from .io import (
     ensure_dir,
+    load_image,
     load_images_from_dir,
     bgr_u8_to_torch_m11,
     torch_m11_to_bgr_u8,
